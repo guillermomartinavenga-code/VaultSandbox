@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:name=".VaultKeeperApp"
+        android:allowBackup="false"
+        android:label="VaultKeeper"
+        android:theme="@style/Theme.VaultKeeper"
+        android:icon="@mipmap/ic_launcher">
+
+        <activity
+            android:name=".presentation.ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            v0.1 baseline: exported on purpose (narrative: a hypothetical Chrome extension via
+            a companion app would query it to autofill credentials — see
+            docs/practical-evidence.md). query()/openFile() are NOT hardened yet: this is the
+            naive starting state vulnerabilities #1 and #2 are demonstrated against in the
+            next stages.
+        -->
+        <provider
+            android:name=".data.provider.VaultContentProvider"
+            android:authorities="dev.guillermomartin.vaultkeeper.provider"
+            android:exported="true" />
+
+    </application>
+
+</manifest>

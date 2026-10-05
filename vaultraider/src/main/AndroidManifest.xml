@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Required since Android 11 (API 30): package visibility rules block resolving another
+        app's ContentProvider by authority unless declared here, regardless of any legitimate
+        relationship between the apps (see docs/practical-evidence.md, unplanned finding).
+        This grants no special permission or trust — a real attacker would add this exact
+        same declaration.
+    -->
+    <queries>
+        <provider android:authorities="dev.guillermomartin.vaultkeeper.provider" />
+    </queries>
+
+    <application
+        android:name=".VaultRaiderApp"
+        android:allowBackup="false"
+        android:label="VaultRaider"
+        android:theme="@style/Theme.VaultRaider"
+        android:icon="@mipmap/ic_launcher">
+
+        <activity
+            android:name=".presentation.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
