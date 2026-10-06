@@ -346,3 +346,59 @@ Fails, even though the target file genuinely exists (`adb shell run-as dev.guill
 ### v0.4 closed
 
 Vuln #2 is proven with a real, reproducible plaintext credential leak (`vault.db-wal`) read through `openFile()`, confirmed both via `adb` and via `VaultRaider`'s own UI, and scoped with a real negative test showing the traversal is bounded by the OS sandbox even though the app-level check is completely absent. v0.5 fixes this by resolving the requested file's canonical path and rejecting anything that falls outside `faviconsDir`'s canonical path.
+
+## v0.5 — Fixing the path traversal (vuln #2)
+
+`VaultContentProvider.openFile()` still takes the filename from the URI's last path segment — including whatever `..`/`/` a `%2F`-encoded payload decodes to — but now resolves the resulting file's canonical path and checks it against `faviconsDir`'s own canonical path before opening anything:
+
+```kotlin
+FAVICON -> {
+    val filename = uri.lastPathSegment
+        ?: throw IllegalArgumentException("Missing filename in $uri")
+    val file = resolveFaviconFile(faviconStore.faviconsDir, filename)
+    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+}
+
+private fun resolveFaviconFile(faviconsDir: File, filename: String): File {
+    val faviconsRoot = faviconsDir.canonicalFile
+    val resolved = File(faviconsDir, filename).canonicalFile
+    require(resolved == faviconsRoot || resolved.path.startsWith(faviconsRoot.path + File.separator)) {
+        "Resolved path escapes the favicons directory: $filename"
+    }
+    return resolved
+}
+```
+
+Resolving `.canonicalFile` collapses any `..` segments against the real filesystem before the comparison, so it doesn't matter whether the traversal arrived as literal `../` or as the `%2F`-encoded form that defeated the `UriMatcher` in v0.4 — both decode to the same `../../...` string by the time `openFile()` sees it, and both now fail the same canonical-path check.
+
+### Re-running the exact v0.4 attacks (now fail)
+
+Rebuilt and reinstalled `VaultKeeper` (`VaultRaider`'s code is unchanged since v0.4 — the fix is entirely provider-side), confirmed via `adb shell content read`:
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/..%2F..%2Fdatabases%2Fvault.db-wal"
+Error while accessing provider:dev.guillermomartin.vaultkeeper.provider
+java.lang.IllegalArgumentException: Resolved path escapes the favicons directory: ../../databases/vault.db-wal
+```
+
+And the cross-UID attempt from attack 2:
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/..%2F..%2F..%2Fdev.guillermomartin.vaultraider%2Ffiles%2FprofileInstalled"
+Error while accessing provider:dev.guillermomartin.vaultkeeper.provider
+java.lang.IllegalArgumentException: Resolved path escapes the favicons directory: ../../../dev.guillermomartin.vaultraider/files/profileInstalled
+```
+
+Both now rejected before any file is opened. Confirmed again directly inside `VaultRaider`'s own UI (favicon filename field set to attack 1's payload): same real output, exception surfaced through the client's own `AttackResult.Failure` — `Error: IllegalArgumentException: Resolved path escapes the favicons directory: ../../databases/vault.db-wal`.
+
+### Confirming the legitimate path still works
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/example.test.png"
+```
+
+Still returns the real 67-byte placeholder PNG unchanged — the fix rejects traversal outside `faviconsDir` while still serving the one file shape the provider was always meant to serve.
+
+### v0.5 closed
+
+Vuln #2 is fixed and verified with a real negative test (both v0.4 payloads now throw, including the cross-UID one that the OS sandbox already blocked on its own) and a real positive test (the intended favicon read still works). Both vulns demonstrated so far (#1 SQL injection, #2 path traversal) are now fixed; vuln #3 (unencrypted local database, readable via `adb shell run-as` on a debuggable build) remains open — exploited next in v0.6.

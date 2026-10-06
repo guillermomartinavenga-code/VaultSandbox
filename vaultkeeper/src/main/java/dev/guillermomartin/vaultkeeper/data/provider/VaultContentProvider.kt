@@ -18,7 +18,8 @@ import java.io.File
  * (via a companion app, never implemented in this repo — see docs/practical-evidence.md) would
  * query it to autofill credentials. `query()`'s SQL injection (vuln #1) was fixed in v0.3 by
  * validating `selection`/`sortOrder`/`projection` against an allowlist and binding values instead
- * of concatenating them. `openFile()`'s path traversal (vuln #2) is still unhardened — fixed in v0.5.
+ * of concatenating them. `openFile()`'s path traversal (vuln #2) was fixed in v0.5 by resolving
+ * the requested file's canonical path and rejecting anything outside `faviconsDir`.
  */
 class VaultContentProvider : ContentProvider(), KoinComponent {
 
@@ -60,12 +61,13 @@ class VaultContentProvider : ContentProvider(), KoinComponent {
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
         return when (MATCHER.match(uri)) {
             FAVICON -> {
-                // Deliberately vulnerable (vuln #2, v0.1): the filename comes straight from the
-                // last path segment of the URI without validating the resulting canonical path
-                // against the allowed favicons directory. Fixed in v0.5.
+                // Fixed in v0.5 (was vuln #2 in v0.1/v0.4): the filename is still taken from the
+                // URI's last path segment — including whatever `..`/`/` a %2F-encoded payload
+                // decodes to — but the resulting file's canonical path is now resolved and
+                // checked against the favicons directory's own canonical path before opening it.
                 val filename = uri.lastPathSegment
                     ?: throw IllegalArgumentException("Missing filename in $uri")
-                val file = File(faviconStore.faviconsDir, filename)
+                val file = resolveFaviconFile(faviconStore.faviconsDir, filename)
                 ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
             }
             else -> throw IllegalArgumentException("Unsupported URI: $uri")
@@ -130,6 +132,15 @@ class VaultContentProvider : ContentProvider(), KoinComponent {
                 "Unsupported sortOrder — only an allowlisted column optionally followed by ASC/DESC is accepted: $sortOrder"
             }
             return trimmed
+        }
+
+        private fun resolveFaviconFile(faviconsDir: File, filename: String): File {
+            val faviconsRoot = faviconsDir.canonicalFile
+            val resolved = File(faviconsDir, filename).canonicalFile
+            require(resolved == faviconsRoot || resolved.path.startsWith(faviconsRoot.path + File.separator)) {
+                "Resolved path escapes the favicons directory: $filename"
+            }
+            return resolved
         }
     }
 }
