@@ -18,16 +18,19 @@
         </activity>
 
         <!--
-            v0.1 baseline: exported on purpose (narrative: a hypothetical Chrome extension via
-            a companion app would query it to autofill credentials — see
-            docs/practical-evidence.md). query()/openFile() are NOT hardened yet: this is the
-            naive starting state vulnerabilities #1 and #2 are demonstrated against in the
-            next stages.
+            v0.8: exported="false" — the first line of defense, ahead of hardening query()/
+            openFile()/the DB itself (v0.3/v0.5/v0.7). v0.1-v0.7 kept this exported="true" purely
+            so VaultRaider could demonstrate vulns #1-#3 and their fixes; the hypothetical
+            Chrome-extension companion app (narrative only, never implemented — see
+            docs/practical-evidence.md) would need to actually be bundled/signed with VaultKeeper
+            itself to use this provider now, not reach it as an unrelated third-party app. An
+            exported="true" + signature-permission variant was validated too (same doc) and then
+            reverted — not needed here since there's no real signed companion app in this repo.
         -->
         <provider
             android:name=".data.provider.VaultContentProvider"
             android:authorities="dev.guillermomartin.vaultkeeper.provider"
-            android:exported="true" />
+            android:exported="false" />
 
     </application>
 

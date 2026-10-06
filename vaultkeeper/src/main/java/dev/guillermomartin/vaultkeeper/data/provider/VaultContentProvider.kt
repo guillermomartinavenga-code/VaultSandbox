@@ -14,12 +14,14 @@ import org.koin.core.component.inject
 import java.io.File
 
 /**
- * Exported (`exported="true"`) because the narrative is that a hypothetical Chrome extension
- * (via a companion app, never implemented in this repo — see docs/practical-evidence.md) would
- * query it to autofill credentials. `query()`'s SQL injection (vuln #1) was fixed in v0.3 by
- * validating `selection`/`sortOrder`/`projection` against an allowlist and binding values instead
- * of concatenating them. `openFile()`'s path traversal (vuln #2) was fixed in v0.5 by resolving
- * the requested file's canonical path and rejecting anything outside `faviconsDir`.
+ * `exported="false"` since v0.8 — the narrative's hypothetical Chrome-extension companion app
+ * (never implemented in this repo — see docs/practical-evidence.md) would need to actually be
+ * bundled/signed with VaultKeeper itself to reach this provider now, not arrive as an unrelated
+ * third-party app the way `VaultRaider` does. `query()`'s SQL injection (vuln #1) was fixed in
+ * v0.3 by validating `selection`/`sortOrder`/`projection` against an allowlist and binding values
+ * instead of concatenating them. `openFile()`'s path traversal (vuln #2) was fixed in v0.5 by
+ * resolving the requested file's canonical path and rejecting anything outside `faviconsDir`.
+ * `vault.db` itself was encrypted at rest with SQLCipher in v0.7 (vuln #3).
  */
 class VaultContentProvider : ContentProvider(), KoinComponent {
 

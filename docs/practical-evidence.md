@@ -644,3 +644,107 @@ Error: in prepare, file is not a database (26)
 ### v0.7 closed
 
 Vuln #3 is fixed: the same `adb shell run-as` access that dumped full plaintext credentials in v0.6 now recovers only authenticated ciphertext, verified with a real negative test (`strings`/`sqlite3` against the encrypted files come back empty/rejected) run against the exact files pulled with the exact same commands as v0.6. All three vulnerabilities (#1 SQL injection, #2 path traversal, #3 unencrypted database) are now fixed. What remains per the original project plan is v0.8 — hardening the provider itself (`exported=false` + signature-permission variant) as defense in depth, since the fixes so far close the specific bugs but the provider is still, by design, reachable by any app on the device.
+
+## v0.8 — Hardening the exposure surface itself
+
+All three vulns are fixed, but `VaultContentProvider` has stayed `exported="true"` the whole time purely so `VaultRaider` could reach it to demonstrate each one. This closing stage applies the theory doc's own lesson: not exporting a component at all is the first line of defense, ahead of (and independent from) hardening what it does internally.
+
+### Part A — `exported="false"`
+
+```xml
+<provider
+    android:name=".data.provider.VaultContentProvider"
+    android:authorities="dev.guillermomartin.vaultkeeper.provider"
+    android:exported="false" />
+```
+
+Rebuilt and reinstalled `VaultKeeper`. Tried the same three attack surfaces used throughout the project — and got three genuinely different failure modes depending on the caller's privilege level, all blocked, but informative about how Android enforces this:
+
+**`adb shell` (uid 2000, shell) — gets far enough to receive an explicit denial:**
+```
+$ adb shell content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials
+java.lang.SecurityException: Permission Denial: opening provider dev.guillermomartin.vaultkeeper.data.provider.VaultContentProvider
+from (null) (pid=19851, uid=2000) that is not exported from UID 10235
+```
+
+**`VaultRaider` (a real third-party app, uid 10236) — can't even resolve the provider, no exception surfaces to the app's own code:**
+```
+Query credentials → "Error: query() returned null"
+Read favicon file  → "Error: FileNotFoundException: No content provider: content://.../favicons/example.test.png"
+```
+```
+$ adb logcat
+AppsFilter: interaction ... vaultraider/10236 -> ... vaultkeeper/10235 BLOCKED
+ActivityThread: Failed to find provider info for dev.guillermomartin.vaultkeeper.provider
+```
+
+**Drozer (`com.withsecure.dz`, uid 10237) — same `SecurityException` text as `adb shell`:**
+```
+dz> run app.package.attacksurface dev.guillermomartin.vaultkeeper
+Attack Surface:
+  2 activities exported
+  1 broadcast receivers exported
+  0 content providers exported
+  0 services exported
+    is debuggable
+
+dz> run app.provider.query content://dev.guillermomartin.vaultkeeper.provider/credentials
+Exception occured: Permission Denial: opening provider ... that is not exported from UID 10235
+```
+
+**Unplanned finding — same denial, three different error surfaces.** `adb shell content` and drozer both get as far as attempting provider resolution through `ActivityManagerService` and receive the real `SecurityException` text back. A genuine app using the standard `ContentResolver.query()`/`openInputStream()` APIs (`VaultRaider`) never sees that exception at all — the framework fails earlier, at provider-info resolution, and surfaces it to app code as a plain `null` cursor or a generic `FileNotFoundException`. All three are equally blocked; a real attacker limited to writing an app (not holding shell/debugging tools) would get the least diagnostic information of the three, which is arguably a feature, not a bug.
+
+`attacksurface`'s own count (`0 content providers exported`) confirms the fix at the manifest level directly, independent of any runtime attack attempt.
+
+### Part B — exploring the alternative: `exported="true"` + signature-level permission
+
+The project also wants to validate the theory doc's other documented option — exporting on purpose but gating it with a custom `protectionLevel="signature"` permission — for the (not implemented in this repo) case where a real, separately-signed companion app would need legitimate access. Applied **temporarily** (not left as the final committed state — there is no real signed companion app in this repo to grant it to):
+
+```xml
+<permission
+    android:name="dev.guillermomartin.vaultkeeper.provider.ACCESS"
+    android:protectionLevel="signature" />
+<provider
+    android:name=".data.provider.VaultContentProvider"
+    android:authorities="dev.guillermomartin.vaultkeeper.provider"
+    android:exported="true"
+    android:permission="dev.guillermomartin.vaultkeeper.provider.ACCESS" />
+```
+
+`VaultKeeper` and `VaultRaider` are signed with two distinct debug keystores committed to this repo specifically so this check is real, not an artifact of both apps sharing Android Studio's default debug keystore (see project plan notes). Rebuilt and reinstalled `VaultKeeper` with this variant; re-ran the same three attacks:
+
+```
+$ adb shell content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials
+java.lang.SecurityException: ... requires dev.guillermomartin.vaultkeeper.provider.ACCESS or dev.guillermomartin.vaultkeeper.provider.ACCESS
+```
+
+This time `VaultRaider`'s own code *does* see the full exception — unlike Part A, the provider is exported and resolvable, so the failure happens later, at the permission check, and propagates normally through the Binder call:
+```
+Query credentials → "Error: SecurityException: Permission Denial: opening provider ... from ProcessRecord{...vaultraider/u0a236} (pid=19899, uid=10236) requires dev.guillermomartin.vaultkeeper.provider.ACCESS or dev.guillermomartin.vaultkeeper.provider.ACCESS"
+Read favicon file  → same exception
+```
+
+And Drozer, consistently:
+```
+dz> run app.package.attacksurface dev.guillermomartin.vaultkeeper
+  1 content providers exported
+dz> run app.provider.query content://dev.guillermomartin.vaultkeeper.provider/credentials
+Exception occured: Permission Denial: ... requires dev.guillermomartin.vaultkeeper.provider.ACCESS or dev.guillermomartin.vaultkeeper.provider.ACCESS
+```
+
+Confirms the two controls fail differently but both work: `exported="false"` blocks resolution outright regardless of signature; `exported="true"` + a signature permission stays technically reachable but still rejects any caller not signed with the same key as `VaultKeeper` — exactly the mechanism a real Chrome-extension companion app would need to share instead.
+
+Reverted the manifest back to the final `exported="false"` state afterward (no lasting committed change from this variant) — confirmed `VaultKeeper`'s own UI (which reads credentials directly through its `CredentialDao`, never through its own `ContentProvider`) is completely unaffected either way, since same-process access never goes through Binder/IPC at all.
+
+### v0.8 closed — project complete
+
+All four points from the theory doc's closing lesson are now demonstrated in real, reproducible code, not just prose:
+
+| # | Risk | Fixed in | Verified by |
+|---|---|---|---|
+| 1 | SQL injection via unparametrized `selection` | v0.3 | v0.2 attacks re-run, now rejected (`adb`, `VaultRaider`, Drozer) |
+| 2 | Path traversal via `openFile()` | v0.5 | v0.4 attacks re-run, now rejected, OS-sandbox boundary also confirmed |
+| 3 | Unencrypted local database | v0.7 | v0.6 attack re-run, only ciphertext recoverable |
+| — | Unnecessary exposure of the provider itself | v0.8 | Same three attack vectors, now blocked at resolution (`exported=false`) or at the permission check (signature variant) |
+
+Final repo state: all three vulnerabilities fixed, provider `exported="false"`. What's left is the polished synthesis document (Spanish first, then English), written separately from this log per the established WeatherApp-precedent pattern.
