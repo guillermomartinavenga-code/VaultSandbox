@@ -274,3 +274,75 @@ Exactly the one matching row — the fix rejects arbitrary SQL while still servi
 ### v0.3 closed
 
 Vuln #1 is fixed and verified with a real negative test (the exact v0.2 payloads now throw) and a real positive test (the intended parametrized query shape still returns correct data). `openFile()`'s path traversal (vuln #2) remains open — exploited next in v0.4.
+
+## v0.4 — Exploiting the path traversal (vuln #2)
+
+Recap of the vulnerable code (unchanged since v0.1, `VaultContentProvider.openFile()`):
+
+```kotlin
+FAVICON -> {
+    val filename = uri.lastPathSegment
+        ?: throw IllegalArgumentException("Missing filename in $uri")
+    val file = File(faviconStore.faviconsDir, filename)
+    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+}
+```
+
+`filename` is the URI's last path segment, joined onto `faviconsDir` with no canonical-path check. The `UriMatcher` pattern `favicons/*` only requires the *raw, undecoded* path to have exactly two segments — but `Uri.getLastPathSegment()` percent-decodes that single segment before returning it. So a literal `/` in the filename (which would split it into extra segments and miss the matcher) can be smuggled in as `%2F`: the matcher still sees one segment, `openFile()` gets back a decoded string containing real `..` and `/` characters.
+
+`VaultRaider` needed no code changes for this stage — `VaultKeeperClient.readFavicon(filename)` (added in v0.1) builds the URI by plain string concatenation, not `Uri.Builder.appendPath()`, so it passes a pre-encoded filename straight through, exactly as a real attacker-controlled input would.
+
+### Baseline — legitimate favicon read
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/example.test.png"
+```
+
+Returns the real 67-byte placeholder PNG (confirmed via `xxd`, starts with the standard `89 50 4E 47` PNG signature).
+
+### Attack 1 — reading VaultKeeper's own SQLite database through the favicon endpoint
+
+`VaultKeeper`'s private storage layout (confirmed via `adb shell run-as dev.guillermomartin.vaultkeeper find . -maxdepth 3`):
+
+```
+./databases/vault.db
+./databases/vault.db-wal
+./databases/vault.db-shm
+./files/favicons/example.test.png
+./files/favicons/mail.example.png
+./files/favicons/shop.example.png
+```
+
+`faviconsDir` is `files/favicons`; two `..` segments climb back to the app's private root, then straight into `databases/`. Payload (`/` encoded as `%2F` so the `UriMatcher` still treats it as one `favicons/*` segment):
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/..%2F..%2Fdatabases%2Fvault.db-wal" > vault_exfil.db-wal
+$ file vault_exfil.db-wal
+vault_exfil.db-wal: SQLite Write-Ahead Log, version 3007000
+$ strings vault_exfil.db-wal | grep -E "example|fake"
+%9Eshop.exampledemo.shop@example.testCassette-Battery-Staple-fake3
+%9%mail.exampledemo.mail@example.testHunter2-fake2
+%/-example.testdemo@example.testTr0ub4dor&3-fake
+```
+
+Full plaintext credential leak — all 3 seeded rows, in the clear — through an endpoint whose only intended purpose is serving cached favicon PNGs. This completely bypasses v0.3's fix: that fix only validates `query()`'s `selection`/`sortOrder`/`projection`, but `openFile()` is a separate vector that reads the raw, unencrypted database file directly off disk, with no SQL involved at all.
+
+**Unplanned finding — why `vault.db` itself (not `-wal`) comes back empty:** fetching `databases/vault.db` directly (`..%2F..%2Fdatabases%2Fvault.db`) returns a valid but essentially empty SQLite file (`database pages 1`, no `credentials` table visible to `sqlite3 .tables`). Room/SQLite defaults to WAL (write-ahead log) journal mode: committed rows live in `vault.db-wal` until a checkpoint merges them back into the main file, which hadn't happened yet on this still-running app process. Real-world implication: an attacker exploiting this class of bug should also fetch the companion `-wal` (and `-shm`) files next to any SQLite database, not just the main file, or they may wrongly conclude the data isn't there.
+
+Reproduced through `VaultRaider`'s actual UI (not just `adb`), via `adb shell input` driving the real on-device "favicon filename" field with the same payload (`..%2F..%2Fdatabases%2Fvault.db-wal`) and tapping "Read favicon file": the app reported `45352 bytes read`, matching the `-wal` file's real size exactly, confirming the same code path (`ContentResolver.openInputStream` → `VaultContentProvider.openFile()`) is exploitable from the app itself, with no `adb`/shell access required by a real attacker.
+
+### Attack 2 — boundary check: does the traversal escape VaultKeeper's own sandbox?
+
+Tried extending the same technique to reach `VaultRaider`'s private storage instead — a file owned by a different UID entirely (`uid=10235` for VaultKeeper vs. `uid=10236` for VaultRaider, confirmed via `adb shell run-as <pkg> id`):
+
+```
+$ adb shell "content read --uri content://dev.guillermomartin.vaultkeeper.provider/favicons/..%2F..%2F..%2Fdev.guillermomartin.vaultraider%2Ffiles%2FprofileInstalled"
+Error while accessing provider:dev.guillermomartin.vaultkeeper.provider
+java.io.FileNotFoundException: open failed: ENOENT (No such file or directory)
+```
+
+Fails, even though the target file genuinely exists (`adb shell run-as dev.guillermomartin.vaultraider ls files/` confirms `profileInstalled` is there) and the relative-path arithmetic is correct. The file read still happens as `VaultKeeper`'s own process/UID (`openFile()` runs inside the provider's host app, not the caller's), so the kernel's DAC permissions plus SELinux's per-app category isolation (distinct `c235,...` vs. `c236,...` contexts, also visible in the `id` output above) block the cross-UID read before the path is ever resolved. This confirms the architecture diagram's premise directly: the app-level path-traversal bug lets `VaultRaider` escape the *intended favicons-only scope* inside `VaultKeeper`'s own sandbox, but it cannot escape the OS-level UID/SELinux sandbox itself to reach a different app's files — that boundary isn't "what this project questions," and it holds.
+
+### v0.4 closed
+
+Vuln #2 is proven with a real, reproducible plaintext credential leak (`vault.db-wal`) read through `openFile()`, confirmed both via `adb` and via `VaultRaider`'s own UI, and scoped with a real negative test showing the traversal is bounded by the OS sandbox even though the app-level check is completely absent. v0.5 fixes this by resolving the requested file's canonical path and rejecting anything that falls outside `faviconsDir`'s canonical path.
