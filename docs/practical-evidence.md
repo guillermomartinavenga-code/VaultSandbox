@@ -574,3 +574,73 @@ versus `VaultKeeper` (`isDebuggable = true` in its `debug` build type) succeedin
 ### v0.6 closed
 
 Vuln #3 is proven with a full plaintext dump of the `credentials` table pulled straight off disk via `adb shell run-as`, independent of both already-fixed provider vulnerabilities, and scoped with a real negative test showing the same command is refused outright against a non-debuggable app on the same device. v0.7 fixes this by encrypting the database at rest with SQLCipher, keyed from an Android Keystore-backed passphrase.
+
+## v0.7 — Fixing the unencrypted database (vuln #3)
+
+`vault.db` is now opened through SQLCipher (`net.zetetic:sqlcipher-android` 4.19.1) instead of the stock Android SQLite driver, with Room wired to it via the classic `SupportSQLiteOpenHelper.Factory` API:
+
+```kotlin
+// DataModule.kt
+single { VaultPassphraseProvider(get()) }
+single {
+    val passphrase = get<VaultPassphraseProvider>().getOrCreatePassphrase()
+    Room.databaseBuilder(get(), VaultDatabase::class.java, VaultDatabase.DATABASE_NAME)
+        .openHelperFactory(SupportOpenHelperFactory(passphrase))
+        .build()
+}
+```
+
+The passphrase itself is a random 32-byte value generated on first run and never stored in the clear — it's wrapped with an AES-256-GCM key that lives in the Android Keystore (`VaultPassphraseProvider.kt`) and is non-exportable by construction:
+
+```kotlin
+val spec = KeyGenParameterSpec.Builder(KEY_ALIAS, PURPOSE_ENCRYPT or PURPOSE_DECRYPT)
+    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+    .setRandomizedEncryptionRequired(true)
+    .build()
+```
+
+Only the Keystore-wrapped ciphertext blob (IV + encrypted passphrase) is persisted, in a regular `SharedPreferences` file — same sandbox exposure as `vault.db` itself, but useless without the key.
+
+### Unplanned finding — upgrading in place (without wiping data) fails loudly
+
+Installed the v0.7 build over the existing v0.6 app without uninstalling first, deliberately, to see what happens to the old plaintext `vault.db` under the new SQLCipher-backed driver. Logcat on first DB access:
+
+```
+sqlcipher   ERROR CORE sqlcipher_page_cipher: hmac check failed for pgno=1
+sqlcipher   ERROR CORE sqlite3Codec: error decrypting page 1 data: 1
+SQLiteLog   E  (26) file is not a database in "SELECT COUNT(*) FROM sqlite_schema;"
+SQLiteDatabase E  Failed to open database '/data/user/0/dev.guillermomartin.vaultkeeper/databases/vault.db'.
+net.zetetic.database.sqlcipher.SQLiteNotADatabaseException: file is not a database (code 26)
+```
+
+SQLCipher tries to authenticate page 1's HMAC using the newly-generated passphrase, fails immediately (the old file was never encrypted with any passphrase at all), and refuses to open it — `SQLITE_NOTADB`, the same error code SQLCipher returns for a wrong passphrase. This is actually the desired failure mode: an app that silently treated a foreign/corrupt file as an empty valid database would be worse. Resolved for this training app by clearing app data (`adb shell pm clear dev.guillermomartin.vaultkeeper`) and relaunching — demo data reseeds into a fresh, encrypted file. (A real product would instead need an explicit plaintext→encrypted migration path, e.g. SQLCipher's `sqlcipher_export()`, which is out of scope here since there's no real user data to preserve.)
+
+### Re-running the v0.6 attack (now yields only ciphertext)
+
+Same commands as v0.6, against the freshly reseeded, encrypted `vault.db`:
+
+```
+$ adb shell run-as dev.guillermomartin.vaultkeeper ls -la databases/
+-rw------- 1 u0_a235 u0_a235  4096 ... vault.db
+-rw------- 1 u0_a235 u0_a235 32768 ... vault.db-shm
+-rw------- 1 u0_a235 u0_a235 24752 ... vault.db-wal
+
+$ adb exec-out run-as dev.guillermomartin.vaultkeeper cat databases/vault.db > vault.db
+$ adb exec-out run-as dev.guillermomartin.vaultkeeper cat databases/vault.db-wal > vault.db-wal
+$ file vault.db vault.db-wal
+vault.db:     data
+vault.db-wal: SQLite Write-Ahead Log, version 3007000
+
+$ strings vault.db vault.db-wal | grep -iE "example|fake|credentials|android_metadata"
+(no matches)
+
+$ sqlite3 vault.db "SELECT * FROM credentials;"
+Error: in prepare, file is not a database (26)
+```
+
+`run-as` still works exactly as before (that's the OS-level debuggable-build exposure from v0.6, unchanged and out of scope for this fix) — but there's nothing left to read. `vault.db`'s own magic header is now encrypted too, so `file` can no longer even recognize it as SQLite (`data`). The lone exception: `vault.db-wal`'s *file-level* header (the 24-byte magic/version/page-size preamble that precedes the actual page frames) isn't itself a SQLCipher-encrypted page, so `file` still identifies it as a WAL container — but the frames inside carry only HMAC-authenticated ciphertext, and the `strings` grep confirms none of the seeded credential/site strings survive in either file.
+
+### v0.7 closed
+
+Vuln #3 is fixed: the same `adb shell run-as` access that dumped full plaintext credentials in v0.6 now recovers only authenticated ciphertext, verified with a real negative test (`strings`/`sqlite3` against the encrypted files come back empty/rejected) run against the exact files pulled with the exact same commands as v0.6. All three vulnerabilities (#1 SQL injection, #2 path traversal, #3 unencrypted database) are now fixed. What remains per the original project plan is v0.8 — hardening the provider itself (`exported=false` + signature-permission variant) as defense in depth, since the fixes so far close the specific bugs but the provider is still, by design, reachable by any app on the device.

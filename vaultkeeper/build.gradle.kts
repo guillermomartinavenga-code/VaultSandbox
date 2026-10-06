@@ -74,8 +74,9 @@ dependencies {
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)
-    // SQLCipher (net.zetetic:sqlcipher-android) and sqlite-ktx are added only in v0.7,
-    // when vulnerability #3 (unencrypted DB) gets fixed — see docs/practical-evidence.md.
+    // v0.7: SQLCipher encrypts vault.db at rest, fixing vuln #3 — see docs/practical-evidence.md.
+    implementation(libs.sqlcipher.android)
+    implementation(libs.androidx.sqlite.ktx)
 
     implementation(libs.koin.android)
     implementation(libs.koin.androidx.compose)
