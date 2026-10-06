@@ -14,10 +14,11 @@ import org.koin.core.component.inject
 import java.io.File
 
 /**
- * v0.1 — deliberately naive starting state. Exported (`exported="true"`) because the narrative
- * is that a hypothetical Chrome extension (via a companion app, never implemented in this repo —
- * see docs/practical-evidence.md) would query it to autofill credentials. Neither query() nor
- * openFile() are hardened yet: that's exactly what the next stages (v0.2–v0.5) exploit and fix.
+ * Exported (`exported="true"`) because the narrative is that a hypothetical Chrome extension
+ * (via a companion app, never implemented in this repo — see docs/practical-evidence.md) would
+ * query it to autofill credentials. `query()`'s SQL injection (vuln #1) was fixed in v0.3 by
+ * validating `selection`/`sortOrder`/`projection` against an allowlist and binding values instead
+ * of concatenating them. `openFile()`'s path traversal (vuln #2) is still unhardened — fixed in v0.5.
  */
 class VaultContentProvider : ContentProvider(), KoinComponent {
 
@@ -35,15 +36,22 @@ class VaultContentProvider : ContentProvider(), KoinComponent {
     ): Cursor? {
         return when (MATCHER.match(uri)) {
             CREDENTIALS -> {
-                // Deliberately vulnerable (vuln #1, v0.1): concatenates `selection`/`sortOrder`
-                // straight into the SQL and ignores `selectionArgs` entirely — no value ever
-                // reaches the database parametrized. Fixed in v0.3.
+                // Fixed in v0.3 (was vuln #1 in v0.1/v0.2): `selection` is restricted to the
+                // single shape `<allowlisted column> = ?`, with the value always bound through
+                // selectionArgs — never spliced into the SQL text. `sortOrder` and `projection`
+                // are validated against the same column allowlist instead of being trusted as-is.
+                val columns = validateProjection(projection)
+                val whereClause = validateSelection(selection, selectionArgs)
+                val orderClause = validateSortOrder(sortOrder)
+
                 val sql = buildString {
-                    append("SELECT * FROM credentials")
-                    if (!selection.isNullOrBlank()) append(" WHERE $selection")
-                    if (!sortOrder.isNullOrBlank()) append(" ORDER BY $sortOrder")
+                    append("SELECT ").append(columns.joinToString(", "))
+                    append(" FROM credentials")
+                    if (whereClause != null) append(" WHERE $whereClause")
+                    if (orderClause != null) append(" ORDER BY $orderClause")
                 }
-                dao.rawQuery(SimpleSQLiteQuery(sql))
+                val bindArgs: Array<Any?> = if (whereClause != null) arrayOf(selectionArgs!![0]) else emptyArray()
+                dao.rawQuery(SimpleSQLiteQuery(sql, bindArgs))
             }
             else -> throw IllegalArgumentException("Unsupported URI: $uri")
         }
@@ -92,5 +100,36 @@ class VaultContentProvider : ContentProvider(), KoinComponent {
 
         fun credentialsUri(): Uri = Uri.parse("content://$AUTHORITY/credentials")
         fun faviconUri(filename: String): Uri = Uri.parse("content://$AUTHORITY/favicons/$filename")
+
+        private val ALLOWED_COLUMNS = listOf("id", "site", "username", "password")
+        private val SELECTION_PATTERN = Regex("^(id|site|username|password)\\s*=\\s*\\?$")
+        private val SORT_ORDER_PATTERN =
+            Regex("^(id|site|username|password)(\\s+(ASC|DESC))?$", RegexOption.IGNORE_CASE)
+
+        private fun validateProjection(projection: Array<out String>?): List<String> {
+            if (projection.isNullOrEmpty()) return ALLOWED_COLUMNS
+            val unknown = projection.filterNot { it in ALLOWED_COLUMNS }
+            require(unknown.isEmpty()) { "Unknown column(s) in projection: $unknown" }
+            return projection.toList()
+        }
+
+        private fun validateSelection(selection: String?, selectionArgs: Array<out String>?): String? {
+            if (selection.isNullOrBlank()) return null
+            val trimmed = selection.trim()
+            require(SELECTION_PATTERN.matches(trimmed)) {
+                "Unsupported selection — only '<column> = ?' against an allowlisted column is accepted: $selection"
+            }
+            require(selectionArgs?.size == 1) { "selection requires exactly one bind argument in selectionArgs" }
+            return trimmed
+        }
+
+        private fun validateSortOrder(sortOrder: String?): String? {
+            if (sortOrder.isNullOrBlank()) return null
+            val trimmed = sortOrder.trim()
+            require(SORT_ORDER_PATTERN.matches(trimmed)) {
+                "Unsupported sortOrder — only an allowlisted column optionally followed by ASC/DESC is accepted: $sortOrder"
+            }
+            return trimmed
+        }
     }
 }

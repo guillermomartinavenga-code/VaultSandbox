@@ -29,6 +29,7 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun AttackScreen(viewModel: AttackViewModel = koinViewModel()) {
     var selectionInput by remember { mutableStateOf("") }
+    var selectionArgsInput by remember { mutableStateOf("") }
     var faviconInput by remember { mutableStateOf("example.test.png") }
     val log by viewModel.log.collectAsState()
 
@@ -49,7 +50,13 @@ fun AttackScreen(viewModel: AttackViewModel = koinViewModel()) {
                 label = { Text("selection (WHERE)") },
                 modifier = Modifier.fillMaxWidth(),
             )
-            Button(onClick = { viewModel.queryCredentials(selectionInput) }) {
+            OutlinedTextField(
+                value = selectionArgsInput,
+                onValueChange = { selectionArgsInput = it },
+                label = { Text("selectionArgs (comma-separated)") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(onClick = { viewModel.queryCredentials(selectionInput, selectionArgsInput) }) {
                 Text("Query credentials")
             }
 

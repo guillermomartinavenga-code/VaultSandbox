@@ -16,10 +16,14 @@ class AttackViewModel(private val client: VaultKeeperClient) : ViewModel() {
     private val _log = MutableStateFlow("Ready. Enter a `selection` and tap \"Query credentials\".")
     val log: StateFlow<String> = _log.asStateFlow()
 
-    fun queryCredentials(selection: String) {
+    fun queryCredentials(selection: String, selectionArgsCsv: String) {
         viewModelScope.launch {
+            val args = selectionArgsCsv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
             val result = withContext(Dispatchers.IO) {
-                client.queryCredentials(selection.ifBlank { null })
+                client.queryCredentials(
+                    selection.ifBlank { null },
+                    args.takeIf { it.isNotEmpty() }?.toTypedArray(),
+                )
             }
             _log.value = result.render()
         }

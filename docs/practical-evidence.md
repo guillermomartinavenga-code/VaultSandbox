@@ -209,3 +209,68 @@ Row: 3 id=1, site=sqlite_sequence, username=CREATE TABLE sqlite_sequence(name,se
 ### v0.2 closed
 
 The SQL injection vulnerability (vuln #1) is proven with real, reproducible output from `VaultRaider` itself, not just ad-hoc tooling. `sortOrder` is built with the exact same string-concatenation pattern and is equally injectable, even though this stage didn't exercise it through the UI (`VaultRaider` only exposes a `selection` field) — it stays in scope for the fix. v0.3 fixes this by parametrizing `selection`/`selectionArgs` through `SimpleSQLiteQuery`'s bind-argument form and validating `sortOrder`/`projection` against an explicit column allowlist.
+
+## v0.3 — Fixing the SQL injection (vuln #1)
+
+`VaultContentProvider.query()` no longer trusts `selection`/`sortOrder`/`projection` as raw SQL text:
+
+```kotlin
+CREDENTIALS -> {
+    val columns = validateProjection(projection)
+    val whereClause = validateSelection(selection, selectionArgs)
+    val orderClause = validateSortOrder(sortOrder)
+
+    val sql = buildString {
+        append("SELECT ").append(columns.joinToString(", "))
+        append(" FROM credentials")
+        if (whereClause != null) append(" WHERE $whereClause")
+        if (orderClause != null) append(" ORDER BY $orderClause")
+    }
+    val bindArgs: Array<Any?> = if (whereClause != null) arrayOf(selectionArgs!![0]) else emptyArray()
+    dao.rawQuery(SimpleSQLiteQuery(sql, bindArgs))
+}
+```
+
+- `selection` must match the single shape `<allowlisted column> = ?` (regex-checked); the value is always supplied via `selectionArgs` and bound through `SimpleSQLiteQuery`'s bind-argument array, never spliced into the SQL string. Anything else — literal values, boolean operators, `UNION`, comments — is rejected with `IllegalArgumentException` before any SQL is built.
+- `sortOrder` must be an allowlisted column name optionally followed by `ASC`/`DESC`.
+- `projection` must only contain the table's real column names (`id`, `site`, `username`, `password`); unknown columns are rejected instead of being ignored.
+
+`VaultRaider` gained a `selectionArgs` input field (comma-separated) so it can exercise the fixed, parametrized call shape — the provider-side fix didn't require any change to the attacker app beyond that.
+
+### Re-running the exact v0.2 attacks (now fail)
+
+Rebuilt and reinstalled both apps, cleared `VaultKeeper`'s app data to reseed fresh fixtures, confirmed via `adb` (`lastUpdateTime` moved to the new install), then re-ran attack 1 verbatim via `adb shell content query`:
+
+```
+$ adb shell "content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials --where \"site = 'nope.invalid' OR '1'='1'\""
+Error while accessing provider:dev.guillermomartin.vaultkeeper.provider
+java.lang.IllegalArgumentException: Unsupported selection — only '<column> = ?' against an allowlisted column is accepted: site = 'nope.invalid' OR '1'='1'
+```
+
+And attack 2 (UNION schema enumeration):
+
+```
+$ adb shell "content query --uri content://dev.guillermomartin.vaultkeeper.provider/credentials --where \"0=1 UNION SELECT 1, name, sql, 'x' FROM sqlite_master WHERE type='table'\""
+Error while accessing provider:dev.guillermomartin.vaultkeeper.provider
+java.lang.IllegalArgumentException: Unsupported selection — only '<column> = ?' against an allowlisted column is accepted: 0=1 UNION SELECT 1, name, sql, 'x' FROM sqlite_master WHERE type='table'
+```
+
+Confirmed again directly inside `VaultRaider` (selection field set to attack 1's payload, `selectionArgs` left empty): same real output, exception surfaced through the client's own `AttackResult.Failure`:
+
+```
+Error: IllegalArgumentException: Unsupported selection — only '<column> = ?' against an allowlisted column is accepted: site = 'nope.invalid' OR '1'='1'
+```
+
+### Confirming the legitimate path still works
+
+From `VaultRaider`, `selection = "site = ?"` with `selectionArgs = "example.test"`:
+
+```
+id=1 | site=example.test | username=demo@example.test | password=Tr0ub4dor&3-fake
+```
+
+Exactly the one matching row — the fix rejects arbitrary SQL while still serving the query shape a well-behaved client (the hypothetical Chrome extension) was always meant to use.
+
+### v0.3 closed
+
+Vuln #1 is fixed and verified with a real negative test (the exact v0.2 payloads now throw) and a real positive test (the intended parametrized query shape still returns correct data). `openFile()`'s path traversal (vuln #2) remains open — exploited next in v0.4.

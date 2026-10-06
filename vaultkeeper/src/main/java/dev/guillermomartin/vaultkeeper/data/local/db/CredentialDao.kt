@@ -22,9 +22,9 @@ interface CredentialDao {
     suspend fun insertAll(entities: List<CredentialEntity>)
 
     /**
-     * Respalda VaultContentProvider#query(): el SQL y los argumentos ligados los arma
-     * el provider a partir de selection/selectionArgs/sortOrder recibidos del llamador
-     * externo — Room solo ejecuta la query ya construida, no la valida.
+     * Backs VaultContentProvider#query(): the SQL and bound arguments are built by the
+     * provider from the selection/selectionArgs/sortOrder it receives from the external
+     * caller — Room only executes the already-built query, it doesn't validate it.
      */
     @RawQuery
     fun rawQuery(query: SupportSQLiteQuery): Cursor
